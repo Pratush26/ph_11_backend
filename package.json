@@ -1,0 +1,25 @@
+{
+  "name": "infracare_backend",
+  "version": "1.0.0",
+  "description": "This is public issues solver website named InfraCare's Backend project",
+  "keywords": [
+    "InfraCare",
+    "Public",
+    "Issues"
+  ],
+  "license": "ISC",
+  "author": "Pratush Barua",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "npx nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.6.0",
+    "mongodb": "^7.0.0"
+  }
+}
