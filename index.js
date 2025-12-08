@@ -74,10 +74,24 @@ app.get("/issues", async (req, res) => {
 })
 
 //  Private Api
-app.get("/staffs", async (req, res) => {
-    const result = await Users.find().toArray()
-    res.send(result || []);
+app.get("/users", async (req, res) => {
+  try {
+    const { role, limit = 10, skip = 0 } = req.query
+
+    const filter = {}
+    if (role) filter.role = role
+
+    const users = await Users.find(filter)
+      .limit(Number(limit))
+      .skip(Number(skip))
+      .toArray()
+
+    res.send(users ?? [])
+  } catch (error) {
+    res.status(500).send({ error: "Failed to fetch users" })
+  }
 })
+
 app.post("/add-staff", verifyToken, async (req, res) => {
     let userRecord;
     try {
@@ -129,6 +143,20 @@ app.post("/add-staff", verifyToken, async (req, res) => {
     }
 });
 
+app.post("/citizen", async (req, res) => {
+    try {
+        const {email, role = "citizen", name, photo} = req.body
+        const exists = await Users.findOne({ email })
+        if (exists) return res.status(200).send({ success: true, message: "Account already Exists!" })
+        
+            const result = await Users.insertOne({email, role, name, photo, blocked: false, createdAt: new Date().toISOString()})
+        if (!result.acknowledged) res.status(500).send({ success: false, message: "Failed to submit your issue" });
+        else res.send({ success: true, message: "Successfully submitted your issue" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
 app.post("/issue", async (req, res) => {
     try {
         const user = await Users.findOne({ email: req?.body?.email })
