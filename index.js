@@ -44,7 +44,10 @@ client.connect()
 //  DB & collections
 const database = client.db("InfraCare");
 const Issues = database.collection("issues");
+const Categories = database.collection("categories");
 const Users = database.collection("users");
+
+Categories.createIndex({ name: 1 }, { unique: true })
 
 //  Middleware
 const verifyToken = async (req, res, next) => {
@@ -63,9 +66,18 @@ const verifyToken = async (req, res, next) => {
 
 //  Public Api
 app.get("/", async (req, res) => res.send("Server is getting!"))
-app.get("/issues", async (req, res) => {
+app.get("/latest-issues", async (req, res) => {
     try {
         const result = await Issues.find().toArray()
+        res.send(result ?? [])
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send([])
+    }
+})
+app.get("/categories", async (req, res) => {
+    try {
+        const result = await Categories.find().toArray()
         res.send(result)
     } catch (error) {
         console.error("DB error: ", error)
@@ -75,21 +87,21 @@ app.get("/issues", async (req, res) => {
 
 //  Private Api
 app.get("/users", async (req, res) => {
-  try {
-    const { role, limit = 10, skip = 0 } = req.query
+    try {
+        const { role, limit = 10, skip = 0 } = req.query
 
-    const filter = {}
-    if (role) filter.role = role
+        const filter = {}
+        if (role) filter.role = role
 
-    const users = await Users.find(filter)
-      .limit(Number(limit))
-      .skip(Number(skip))
-      .toArray()
+        const result = await Users.find(filter)
+            .limit(Number(limit))
+            .skip(Number(skip))
+            .toArray()
 
-    res.send(users ?? [])
-  } catch (error) {
-    res.status(500).send({ error: "Failed to fetch users" })
-  }
+        res.send(result ?? [])
+    } catch (error) {
+        res.status(500).send({ error: "Failed to fetch users" })
+    }
 })
 
 app.post("/add-staff", verifyToken, async (req, res) => {
@@ -130,10 +142,12 @@ app.post("/add-staff", verifyToken, async (req, res) => {
                 address,
                 createdBy: req.token_email,
                 blocked: false,
+                issueSubmited: 0,
+                premium: false,
                 createdAt: new Date().toISOString()
             });
             if (!result.acknowledged) return res.status(500).send({ success: false, message: "Internal Server Error" });
-            return res.send({ success: true, message: "Staff created successfully" });
+            res.send({ success: true, message: "Staff created successfully" });
         }
 
     } catch (error) {
@@ -145,36 +159,100 @@ app.post("/add-staff", verifyToken, async (req, res) => {
 
 app.post("/citizen", async (req, res) => {
     try {
-        const {email, role = "citizen", name, photo} = req.body
+        const { email, role = "citizen", name, photo } = req.body
         const exists = await Users.findOne({ email })
         if (exists) return res.status(200).send({ success: true, message: "Account already Exists!" })
-        
-            const result = await Users.insertOne({email, role, name, photo, blocked: false, createdAt: new Date().toISOString()})
-        if (!result.acknowledged) res.status(500).send({ success: false, message: "Failed to submit your issue" });
-        else res.send({ success: true, message: "Successfully submitted your issue" });
+
+        const result = await Users.insertOne({ email, role, name, photo, blocked: false, issueSubmited: 0, premium: false, createdAt: new Date().toISOString() })
+        if (!result.acknowledged) res.status(500).send({ success: false, message: "Failed create citizen account" });
+        else res.send({ success: true, message: "Successfully created citizen account" });
     } catch (error) {
         console.error("DB error: ", error)
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
 })
-app.post("/issue", async (req, res) => {
+
+app.get("/issues", async (req, res) => {
     try {
-        const user = await Users.findOne({ email: req?.body?.email })
-        if (!user) return res.status(403).send({ success: false, message: "Unauthorized Access!" })
-        const { title, description, image, location, category } = req.body
-        const data = {
+        const { status, email, limit = 10, skip = 0 } = req.query
+
+        const filter = {}
+        if (status) filter.status = status
+        if (email) {
+            const user = await Users.findOne({email}, {projection: {_id: 1}})
+            filter.submittedBy = user._id
+        }
+
+        const result = await Issues.find(filter)
+            .limit(Number(limit))
+            .skip(Number(skip))
+            .toArray()
+
+        res.send(result ?? [])
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send([])
+    }
+})
+app.get("/my-issues", verifyToken, async (req, res) => {
+    try {
+        const { status, limit = 10, skip = 0 } = req.query;
+        const pipeline = [
+            {
+                $lookup: {
+                    from: "users",
+                    localField: "submittedBy",
+                    foreignField: "_id",
+                    as: "user"
+                }
+            },
+            { $unwind: "$user" },
+            { $match: { "user.email": req.token_email } },
+        ];
+        
+        pipeline.push({ $skip: Number(skip) });
+        pipeline.push({ $limit: Number(limit) });
+        if (status) pipeline.push({ $match: { status } });
+
+        const result = await Issues.aggregate(pipeline).toArray();
+        res.send(result ?? []);
+    } catch (error) {
+        console.error("DB error: ", error);
+        res.status(500).send([]);
+    }
+});
+
+app.post("/issue", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, issueSubmited: 1, premium: 1 } })
+        if (!user?._id) return res.status(401).send({ success: false, message: "Unauthorized Access!" })
+        if (!user.premium && user.issueSubmited >= 3) return res.status(406).send({ success: false, message: "Free trier end! Premium subscription required." })
+
+        const { title, description, photo, location, category } = req.body
+        const name = category.trim().toLowerCase()
+        await Categories.updateOne(
+            { name },
+            { $setOnInsert: { name } },
+            { upsert: true }
+        )
+
+        const result = await Issues.insertOne({
             title,
             description,
-            image,
+            photo,
             location,
             category,
-            citizen: user.email,
+            status: "pending",
+            assignedTo: "",
+            priority: "low",
+            submittedBy: user._id,
             updatedAt: new Date().toISOString(),
             createdAt: new Date().toISOString()
-        }
-        const result = await Issues.insertOne(data)
-        if (!result.acknowledged) res.status(500).send({ success: false, message: "Failed to submit your issue" });
-        else res.send({ success: true, message: "Successfully submitted your issue" });
+        })
+        if (!result.acknowledged) return res.status(500).send({ success: false, message: "Failed to submit your issue" });
+        
+        await Users.updateOne({_id: user._id}, {$inc: { issueSubmited: 1 }})
+        res.send({ success: true, message: "Successfully submitted your issue" });
     } catch (error) {
         console.error("DB error: ", error)
         res.status(500).send({ success: false, message: "Internal Server Error!" })
