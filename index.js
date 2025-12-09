@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient, ServerApiVersion } from "mongodb";
+import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 import admin from 'firebase-admin'
 
 dotenv.config();
@@ -68,7 +68,7 @@ const verifyToken = async (req, res, next) => {
 app.get("/", async (req, res) => res.send("Server is getting!"))
 app.get("/latest-issues", async (req, res) => {
     try {
-        const result = await Issues.find().toArray()
+        const result = await Issues.find().sort({ createdAt: 1 }).limit(6).toArray()
         res.send(result ?? [])
     } catch (error) {
         console.error("DB error: ", error)
@@ -174,26 +174,62 @@ app.post("/citizen", async (req, res) => {
 
 app.get("/issues", async (req, res) => {
     try {
-        const { status, email, limit = 10, skip = 0 } = req.query
+        let { page = 1, limit = 10, priority, status } = req.query;
 
-        const filter = {}
-        if (status) filter.status = status
-        if (email) {
-            const user = await Users.findOne({email}, {projection: {_id: 1}})
-            filter.submittedBy = user._id
-        }
+        page = Math.max(1, Number(page));
+        limit = Math.max(1, Number(limit));
 
-        const result = await Issues.find(filter)
-            .limit(Number(limit))
-            .skip(Number(skip))
-            .toArray()
+        const filter = {};
+        if (priority) filter.priority = priority;
+        if (status) filter.status = status;
 
-        res.send(result ?? [])
-    } catch (error) {
-        console.error("DB error: ", error)
-        res.status(500).send([])
+        const pipeline = [
+            { $match: filter },
+            {
+                $addFields: {
+                    priorityOrder: {
+                        $cond: [{ $eq: ["$priority", "high"] }, 1, 2]
+                    }
+                }
+            },
+            { $sort: { priorityOrder: 1, createdAt: -1 } },
+            { $skip: (page - 1) * limit },
+            { $limit: limit }
+        ];
+
+        const result = await Issues.aggregate(pipeline).toArray();
+        res.send(result);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send([]);
     }
+});
+
+app.get("/totalIssues", async (req, res) => {
+    const result = await Issues.countDocuments()
+    res.send(Math.ceil(result/req.query?.limit));
 })
+app.get("/issue/:id", async (req, res) => {
+    try {
+        const pipeline = [
+            { $match: { _id: new ObjectId(req.params.id) } },
+            {
+                $lookup: {
+                    from: "users",
+                    localField: "submittedBy",
+                    foreignField: "_id",
+                    as: "user"
+                }
+            },
+            { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } }
+        ];
+        const result = await Issues.aggregate(pipeline).toArray();
+        res.send(result[0] || {});
+    } catch (err) {
+        console.error(err);
+        res.status(500).send({});
+    }
+});
 app.get("/my-issues", verifyToken, async (req, res) => {
     try {
         const { status, limit = 10, skip = 0 } = req.query;
@@ -207,12 +243,12 @@ app.get("/my-issues", verifyToken, async (req, res) => {
                 }
             },
             { $unwind: "$user" },
-            { $match: { "user.email": req.token_email } },
+            { $filter: { "user.email": req.token_email } },
         ];
-        
+
         pipeline.push({ $skip: Number(skip) });
         pipeline.push({ $limit: Number(limit) });
-        if (status) pipeline.push({ $match: { status } });
+        if (status) pipeline.push({ $filter: { status } });
 
         const result = await Issues.aggregate(pipeline).toArray();
         res.send(result ?? []);
@@ -224,8 +260,9 @@ app.get("/my-issues", verifyToken, async (req, res) => {
 
 app.post("/issue", verifyToken, async (req, res) => {
     try {
-        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, issueSubmited: 1, premium: 1 } })
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, issueSubmited: 1, premium: 1, blocked: 1 } })
         if (!user?._id) return res.status(401).send({ success: false, message: "Unauthorized Access!" })
+        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
         if (!user.premium && user.issueSubmited >= 3) return res.status(406).send({ success: false, message: "Free trier end! Premium subscription required." })
 
         const { title, description, photo, location, category } = req.body
@@ -245,13 +282,14 @@ app.post("/issue", verifyToken, async (req, res) => {
             status: "pending",
             assignedTo: "",
             priority: "low",
+            timeline: [],
             submittedBy: user._id,
             updatedAt: new Date().toISOString(),
             createdAt: new Date().toISOString()
         })
         if (!result.acknowledged) return res.status(500).send({ success: false, message: "Failed to submit your issue" });
-        
-        await Users.updateOne({_id: user._id}, {$inc: { issueSubmited: 1 }})
+
+        await Users.updateOne({ _id: user._id }, { $inc: { issueSubmited: 1 } })
         res.send({ success: true, message: "Successfully submitted your issue" });
     } catch (error) {
         console.error("DB error: ", error)
