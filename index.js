@@ -98,11 +98,30 @@ app.get("/users", async (req, res) => {
 
         const filter = {}
         if (role) filter.role = role
+        const result = await Users.aggregate([
+            { $match: filter },
 
-        const result = await Users.find(filter)
-            .limit(Number(limit))
-            .skip(Number(skip))
-            .toArray()
+            {
+                $lookup: {
+                    from: "issues",
+                    localField: "_id",
+                    foreignField: "submittedBy",
+                    as: "issues"
+                }
+            },
+            {
+                $addFields: {
+                    issueCount: { $size: "$issues" }
+                }
+            },
+            {
+                $project: {
+                    issues: 0
+                }
+            },
+            { $limit: Number(limit) },
+            { $skip: Number(skip) }
+        ]).toArray();
 
         res.send(result ?? [])
     } catch (error) {
@@ -148,7 +167,6 @@ app.post("/add-staff", verifyToken, async (req, res) => {
                 address,
                 createdBy: req.token_email,
                 blocked: false,
-                issueSubmited: 0,
                 premium: false,
                 createdAt: new Date().toISOString()
             });
@@ -169,7 +187,7 @@ app.post("/citizen", async (req, res) => {
         const exists = await Users.findOne({ email })
         if (exists) return res.status(200).send({ success: true, message: "Account already Exists!" })
 
-        const result = await Users.insertOne({ email, role, name, photo, blocked: false, issueSubmited: 0, premium: false, createdAt: new Date().toISOString() })
+        const result = await Users.insertOne({ email, role, name, photo, blocked: false, premium: false, createdAt: new Date().toISOString() })
         if (!result.acknowledged) res.status(500).send({ success: false, message: "Failed create citizen account" });
         else res.send({ success: true, message: "Successfully created citizen account" });
     } catch (error) {
@@ -267,10 +285,11 @@ app.get("/my-issues", verifyToken, async (req, res) => {
 
 app.post("/issue", verifyToken, async (req, res) => {
     try {
-        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, issueSubmited: 1, premium: 1, blocked: 1 } })
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, premium: 1, blocked: 1 } })
         if (!user?._id) return res.status(401).send({ success: false, message: "Unauthorized Access!" })
         if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
-        if (!user.premium && user.issueSubmited >= 3) return res.status(406).send({ success: false, message: "Free trier end! Premium subscription required." })
+        const totalSubmitted = await Issues.countDocuments({ submittedBy: user._id })
+        if (!user.premium && totalSubmitted >= 3) return res.status(406).send({ success: false, message: "Free trier end! Premium subscription required." })
 
         const { title, description, photo, location, category } = req.body
         const name = category.trim().toLowerCase()
@@ -288,6 +307,7 @@ app.post("/issue", verifyToken, async (req, res) => {
             category,
             status: "pending",
             assignedTo: "",
+            voted: [],
             priority: "low",
             timeline: [],
             submittedBy: user._id,
@@ -296,13 +316,33 @@ app.post("/issue", verifyToken, async (req, res) => {
         })
         if (!result.acknowledged) return res.status(500).send({ success: false, message: "Failed to submit your issue" });
 
-        await Users.updateOne({ _id: user._id }, { $inc: { issueSubmited: 1 } })
         res.send({ success: true, message: "Successfully submitted your issue" });
     } catch (error) {
         console.error("DB error: ", error)
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
 })
+app.patch("/upvote", async (req, res) => {
+    const userId = new ObjectId(req.body?.id);
+
+    await Issues.updateOne(
+        { _id: new ObjectId(req.body?.issueId) },
+        [
+            {
+                $set: {
+                    voted: {
+                        $cond: [
+                            { $in: [userId, "$voted"] },  //  condition
+                            { $setDifference: ["$voted", [userId]] }, // remove(true)
+                            { $concatArrays: ["$voted", [userId]] }  // add(false)
+                        ]
+                    }
+                }
+            }
+        ]
+    );
+    res.send({ success: true });
+});
 
 //  payment related route
 app.post("/checkout-session", verifyToken, async (req, res) => {
@@ -316,7 +356,7 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
                 {
                     price_data: {
                         currency: "BDT",
-                        unit_amount: parseFloat(req.body?.price) * 100,
+                        unit_amount: 200 * 100,
                         product_data: {
                             name: issue.title
                         }
@@ -330,8 +370,8 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
                 photo: issue.photo
             },
             mode: 'payment',
-            success_url: `${origin}/after-payment?success=true&session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${origin}/after-payment?success=false`,
+            success_url: `${origin}/after-payment?success=true&type=boost&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${origin}/after-payment?success=false&type=boost`,
         });
         res.send({ url: session.url });
     } catch (error) {
@@ -339,25 +379,35 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
         res.send({ url: "" })
     }
 })
-app.patch("/boost-issuePriority", async (req, res) => {
+app.patch("/update-paymentStatus", async (req, res) => {
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
     const session = await stripe.checkout.sessions.retrieve(req.body.session_id);
     if (session.status === "complete") {
-        const result = await Issues.updateOne({ _id: new ObjectId(session.metadata.issueId), transactionId: null }, {
-            $set: {
-                priority: "high",
-                transactionId: session.payment_intent,
-                updatedAt: new Date().toISOString()
-            },
-            $push: {
-                state: {
-                    title: "Boost priority",
-                    description: `Successfully boost issue priority with ${session.currency.toUpperCase()} ${session?.amount_total / 100}`,
-                    completed: true,
-                    createdAt: new Date().toISOString()
+        if (req.query.type === "boost") {
+            await Issues.updateOne({ _id: new ObjectId(session.metadata.issueId), transactionId: null }, {
+                $set: {
+                    priority: "high",
+                    transactionId: session.payment_intent,
+                    updatedAt: new Date().toISOString()
+                },
+                $push: {
+                    state: {
+                        title: "Boost priority",
+                        description: `Successfully boost issue priority with ${session.currency.toUpperCase()} ${session?.amount_total / 100}`,
+                        completed: true,
+                        createdAt: new Date().toISOString()
+                    }
+                },
+            })
+        }
+        else if (req.query?.type === "subscription") {
+            await Issues.updateOne({ email: session.customer_email, premium: false }, {
+                $set: {
+                    premium: true,
+                    transactionId: session.payment_intent,
                 }
-            },
-        })
+            })
+        }
         await Transactions.updateOne(
             { transactionId: session.payment_intent },
             {
@@ -371,11 +421,40 @@ app.patch("/boost-issuePriority", async (req, res) => {
             },
             { upsert: true }
         );
-        console.log(session)
         if (session.payment_status !== "paid") res.status(402).send({ message: "There is something wrong with your payment process" })
         else res.send({ cost: session.amount_total / 100, currency: session.currency, issueId: session.metadata.issueId })
     }
     else res.status(404).send("Something went wrong!")
+})
+app.post("/premium-checkout-session", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ _id: new ObjectId(req.token_email), });
+        if (user.premium) return res.send({ url: "", message: "You are already a premium subscriber" })
+        const origin = req.headers.origin;
+        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+        const session = await stripe.checkout.sessions.create({
+            line_items: [
+                {
+                    price_data: {
+                        currency: "BDT",
+                        unit_amount: 1000 * 100,
+                        product_data: {
+                            name: "InfraCare Premium Subscription"
+                        }
+                    },
+                    quantity: 1,
+                },
+            ],
+            customer_email: req?.token_email,
+            mode: 'payment',
+            success_url: `${origin}/after-payment?success=true&type=subscription&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${origin}/after-payment?success=false&type=subscription`,
+        });
+        res.send({ url: session.url });
+    } catch (error) {
+        console.error(error)
+        res.send({ url: "" })
+    }
 })
 
 //  transaction route
