@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 import admin from 'firebase-admin'
+import Stripe from "stripe";
 
 dotenv.config();
 const app = express();
@@ -45,6 +46,7 @@ client.connect()
 const database = client.db("InfraCare");
 const Issues = database.collection("issues");
 const Categories = database.collection("categories");
+const Transactions = database.collection("transactions");
 const Users = database.collection("users");
 
 Categories.createIndex({ name: 1 }, { unique: true })
@@ -55,7 +57,7 @@ const verifyToken = async (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(" ")[1];
         const decoded = await admin.auth().verifyIdToken(token);
-        if (!decoded.email) return res.status(401).send("Unauthorized Access");
+        if (!decoded?.email) return res.status(401).send("Unauthorized Access");
         req.token_email = decoded.email
         next();
     } catch (err) {
@@ -207,7 +209,7 @@ app.get("/issues", async (req, res) => {
 
 app.get("/totalIssues", async (req, res) => {
     const result = await Issues.countDocuments()
-    res.send(Math.ceil(result/req.query?.limit));
+    res.send(Math.ceil(result / req.query?.limit));
 })
 app.get("/issue/:id", async (req, res) => {
     try {
@@ -243,7 +245,7 @@ app.get("/my-issues", verifyToken, async (req, res) => {
                 }
             },
             { $unwind: "$user" },
-            { $filter: { "user.email": req.token_email } },
+            { $match: { "user.email": req.token_email } },
         ];
 
         pipeline.push({ $skip: Number(skip) });
@@ -295,4 +297,65 @@ app.post("/issue", verifyToken, async (req, res) => {
         console.error("DB error: ", error)
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
+})
+
+//  payment related route
+app.post("/checkout-session", verifyToken, async (req, res) => {
+    try {
+        const issue = await Issues.findOne({ _id: new ObjectId(req.body?.id) });
+        if (!issue) return res.send({ url: "" })
+        const origin = req.headers.origin;
+        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+        const session = await stripe.checkout.sessions.create({
+            line_items: [
+                {
+                    price_data: {
+                        currency: "BDT",
+                        unit_amount: parseFloat(req.body?.price)*100,
+                        product_data: {
+                            name: issue.title
+                        }
+                    },
+                    quantity: 1,
+                },
+            ],
+            customer_email: req?.token_email,
+            metadata: {
+                issueId: req.body?.id,
+                photo: issue.photo
+            },
+            mode: 'payment',
+            success_url: `${origin}/after-payment?success=true&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${origin}/after-payment?success=false`,
+        });
+        res.send({ url: session.url });
+    } catch (error) {
+        console.error(error)
+        res.send({ url: "" })
+    }
+})
+app.patch("/boost-issuePriority", async (req, res) => {
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const session = await stripe.checkout.sessions.retrieve(req.body.session_id);
+    if (session.status === "complete") {
+        const result = await Issues.updateOne({ _id: new ObjectId(session.metadata.issueId), transactionId: null }, {
+            $set: {
+                priority: "high",
+                transactionId: session.payment_intent,
+                updatedAt: new Date().toISOString()
+            },
+            $push: {
+                state: {
+                    title: "Boost priority",
+                    description: `Successfully boost issue priority with ${session.currency.toUpperCase()} ${session?.amount_total/100}`,
+                    completed: true,
+                    createdAt: new Date().toISOString()
+                }
+            },
+        })
+        console.log(result)
+        if (session.payment_status !== "paid") res.status(402).send({ message: "There is something wrong with your payment process" })
+        else res.send({ cost: session.amount_total / 100, currency: session.currency, issueId: session.metadata.issueId })
+    }
+    else res.status(404).send("Something went wrong!")
 })
