@@ -9,8 +9,11 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 2000;
 const uri = process.env.DB;
+const allowedOrigins = process.env.FRONTENDS.split(",");
 
-app.use(cors())
+app.use(cors({
+    origin: allowedOrigins ? allowedOrigins : ['http://localhost:5173']
+}));
 app.use(express.json());
 
 admin.initializeApp({
@@ -50,6 +53,7 @@ const Transactions = database.collection("transactions");
 const Users = database.collection("users");
 
 Categories.createIndex({ name: 1 }, { unique: true })
+Transactions.createIndex({ transactionId: 1 }, { unique: true });
 
 //  Middleware
 const verifyToken = async (req, res, next) => {
@@ -174,6 +178,7 @@ app.post("/citizen", async (req, res) => {
     }
 })
 
+// Issues api
 app.get("/issues", async (req, res) => {
     try {
         let { page = 1, limit = 10, priority, status } = req.query;
@@ -311,7 +316,7 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
                 {
                     price_data: {
                         currency: "BDT",
-                        unit_amount: parseFloat(req.body?.price)*100,
+                        unit_amount: parseFloat(req.body?.price) * 100,
                         product_data: {
                             name: issue.title
                         }
@@ -347,15 +352,56 @@ app.patch("/boost-issuePriority", async (req, res) => {
             $push: {
                 state: {
                     title: "Boost priority",
-                    description: `Successfully boost issue priority with ${session.currency.toUpperCase()} ${session?.amount_total/100}`,
+                    description: `Successfully boost issue priority with ${session.currency.toUpperCase()} ${session?.amount_total / 100}`,
                     completed: true,
                     createdAt: new Date().toISOString()
                 }
             },
         })
-        console.log(result)
+        await Transactions.updateOne(
+            { transactionId: session.payment_intent },
+            {
+                $setOnInsert: {
+                    transactionId: session.payment_intent,
+                    paidBy: session.customer_email,
+                    status: session.status, issue: session.metadata.issueId,
+                    amount: session?.amount_total / 100,
+                    createdAt: new Date().toISOString()
+                }
+            },
+            { upsert: true }
+        );
+        console.log(session)
         if (session.payment_status !== "paid") res.status(402).send({ message: "There is something wrong with your payment process" })
         else res.send({ cost: session.amount_total / 100, currency: session.currency, issueId: session.metadata.issueId })
     }
     else res.status(404).send("Something went wrong!")
+})
+
+//  transaction route
+app.get("/transactions", async (req, res) => {
+    try {
+        let { page = 1, limit = 10, email } = req.query;
+        const filter = {};
+
+        page = Math.max(1, Number(page));
+        limit = Math.max(1, Number(limit));
+        if (email) filter.email = email;
+
+        const pipeline = [
+            { $match: filter },
+            { $skip: (page - 1) * limit },
+            { $limit: limit }
+        ];
+        const result = await Transactions.aggregate(pipeline).toArray();
+        res.send(result);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send([]);
+    }
+});
+
+app.get("/totalTransactions", async (req, res) => {
+    const result = await Transactions.countDocuments()
+    res.send(Math.ceil(result / req.query?.limit));
 })
