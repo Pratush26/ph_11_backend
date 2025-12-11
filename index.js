@@ -74,7 +74,7 @@ const verifyToken = async (req, res, next) => {
 app.get("/", async (req, res) => res.send("Server is getting!"))
 app.get("/latest-issues", async (req, res) => {
     try {
-        const result = await Issues.find().sort({ createdAt: 1 }).limit(6).toArray()
+        const result = await Issues.find().sort({ createdAt: -1 }).limit(6).toArray()
         res.send(result ?? [])
     } catch (error) {
         console.error("DB error: ", error)
@@ -94,7 +94,7 @@ app.get("/categories", async (req, res) => {
 //  Private Api
 //  users route
 app.get("/userInfo", verifyToken, async (req, res) => {
-    const result = await Users.findOne({email: req?.token_email})
+    const result = await Users.findOne({ email: req?.token_email })
     res.send(result ?? {});
 })
 app.get("/users", async (req, res) => {
@@ -105,7 +105,6 @@ app.get("/users", async (req, res) => {
         if (role) filter.role = role
         const result = await Users.aggregate([
             { $match: filter },
-
             {
                 $lookup: {
                     from: "issues",
@@ -115,17 +114,36 @@ app.get("/users", async (req, res) => {
                 }
             },
             {
-                $addFields: {
-                    issueCount: { $size: "$issues" }
+                $lookup: {
+                    from: "issues",
+                    let: { userId: "$_id" },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: { $eq: ["$assignedTo", "$$userId"] },
+                                status: { $in: ["in-progress", "working"] }
+                            }
+                        }
+                    ],
+                    as: "assigned"
                 }
             },
             {
-                $project: {
-                    issues: 0
+                $addFields: {
+                    issueCount: { $size: "$issues" },
+                    assignedCount: { $size: "$assigned" },
                 }
             },
-            { $limit: Number(limit) },
-            { $skip: Number(skip) }
+            { $project: { issues: 0 } },
+            {
+                $sort: {
+                    premium: -1,
+                    assignedCount: 1
+                }
+            },
+
+            { $skip: Number(skip) },
+            { $limit: Number(limit) }
         ]).toArray();
 
         res.send(result ?? [])
@@ -327,19 +345,22 @@ app.post("/issue", verifyToken, async (req, res) => {
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
 })
-app.patch("/upvote", async (req, res) => {
-    const userId = new ObjectId(req.body?.id);
+app.patch("/upvote", verifyToken, async (req, res) => {
+    const user = await Users.findOne({ email: req.token_email })
 
     await Issues.updateOne(
-        { _id: new ObjectId(req.body?.issueId) },
+        {
+            _id: new ObjectId(req.body.issueId),
+            submittedBy: { $ne: user._id }
+        },
         [
             {
                 $set: {
                     voted: {
                         $cond: [
-                            { $in: [userId, "$voted"] },  //  condition
-                            { $setDifference: ["$voted", [userId]] }, // remove(true)
-                            { $concatArrays: ["$voted", [userId]] }  // add(false)
+                            { $in: [user._id, "$voted"] },  //  condition
+                            { $setDifference: ["$voted", [user._id]] }, // remove(true)
+                            { $concatArrays: ["$voted", [user._id]] }  // add(false)
                         ]
                     }
                 }
@@ -347,6 +368,31 @@ app.patch("/upvote", async (req, res) => {
         ]
     );
     res.send({ success: true });
+});
+app.patch("/assign-issue", verifyToken, async (req, res) => {
+    const user = await Users.findOne({ email: req.token_email });
+    if (user.role !== "admin") res.status(403).send({ success: false, message: "Forbidden Access!" })
+
+    const staff = await Users.findOne({ _id: new ObjectId(req.body.staffId) });
+    if (!staff) return res.status(404).send({ error: "Staff not found" });
+
+    const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId) }, {
+        $set: {
+            status: "in-progress",
+            assignedTo: staff._id,
+            updatedAt: new Date().toISOString,
+        },
+        $push: {
+            state: {
+                title: "Assign staff",
+                description: `Authority assigned ${staff.name} for investigating`,
+                completed: true,
+                createdAt: new Date().toISOString()
+            }
+        },
+    });
+    if(!result.modifiedCount) return res.status(500).send({success: false, message: "Internal Server Error!"})
+    res.send({ success: true, message: "Successfully assigned staff" });
 });
 
 //  payment related route
@@ -361,7 +407,7 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
                 {
                     price_data: {
                         currency: "BDT",
-                        unit_amount: 200 * 100,
+                        unit_amount: 100 * 100,
                         product_data: {
                             name: issue.title
                         }
@@ -406,7 +452,7 @@ app.patch("/update-paymentStatus", async (req, res) => {
             })
         }
         else if (req.query?.type === "subscription") {
-            await Issues.updateOne({ email: session.customer_email, premium: false }, {
+            await Users.updateOne({ email: session.customer_email, premium: false }, {
                 $set: {
                     premium: true,
                     transactionId: session.payment_intent,
@@ -433,7 +479,7 @@ app.patch("/update-paymentStatus", async (req, res) => {
 })
 app.post("/premium-checkout-session", verifyToken, async (req, res) => {
     try {
-        const user = await Users.findOne({ _id: new ObjectId(req.token_email), });
+        const user = await Users.findOne({ email: req.token_email });
         if (user.premium) return res.send({ url: "", message: "You are already a premium subscriber" })
         const origin = req.headers.origin;
         const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
