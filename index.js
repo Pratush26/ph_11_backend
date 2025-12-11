@@ -92,6 +92,11 @@ app.get("/categories", async (req, res) => {
 })
 
 //  Private Api
+//  users route
+app.get("/userInfo", verifyToken, async (req, res) => {
+    const result = await Users.findOne({email: req?.token_email})
+    res.send(result ?? {});
+})
 app.get("/users", async (req, res) => {
     try {
         const { role, limit = 10, skip = 0 } = req.query
