@@ -90,7 +90,7 @@ app.get("/issues", async (req, res) => {
         limit = Math.max(1, Number(limit));
 
         const filter = {};
-        if (search)  filter.title = { $regex: search.trim(), $options: "i" };
+        if (search) filter.title = { $regex: search.trim(), $options: "i" };
         if (priority) filter.priority = priority;
         if (category) filter.category = category;
         if (status) filter.status = status;
@@ -256,10 +256,38 @@ app.post("/citizen", async (req, res) => {
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
 })
+app.patch("/userInfo", verifyToken, async (req, res) => {
+    try {
+        const { name, address, phone } = req.body
+        const result = await Users.updateOne({ email: req.token_email }, {
+            $set: { name, address, phone }
+        })
+
+        if (!result.modifiedCount) res.status(500).send({ success: false, message: "Failed to update profile details" });
+        else res.send({ success: true, message: "Successfully updated profile details" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
+app.patch("/userImg", verifyToken, async (req, res) => {
+    try {
+        const result = await Users.updateOne({ email: req.token_email }, { $set: { photo: req.body?.photo } })
+
+        if (!result.modifiedCount) res.status(500).send({ success: false, message: "Failed to update profile details" });
+        else res.send({ success: true, message: "Successfully updated profile details" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
 
 // Issues api
 app.get("/privateIssues", verifyToken, async (req, res) => {
     try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
+        if (!user) return res.status(401).send([]);
+
         let { page = 1, limit = 10, priority, status, assignedTo } = req.query;
 
         page = Math.max(1, Number(page));
@@ -268,9 +296,12 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         const filter = {};
         if (priority) filter.priority = priority;
         if (status) filter.status = status;
-        if (assignedTo) {
-            const staff = await Users.findOne({ email: req.token_email })
-            filter.assignedTo = staff._id;
+
+        if (user.role !== "admin") {
+            filter.$or = [
+                { assignedTo: user._id },
+                { submittedBy: user._id }
+            ];
         }
 
         const result = await Issues.aggregate([
@@ -671,7 +702,7 @@ app.patch("/issue-status", verifyToken, async (req, res) => {
     const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId), assignedTo: staff._id }, {
         $set: {
             status: req.body.status,
-            updatedAt: new Date().toISOString,
+            updatedAt: new Date().toISOString(),
         },
         $push: {
             state: {
@@ -696,7 +727,7 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
         $set: {
             status: "in-progress",
             assignedTo: staff._id,
-            updatedAt: new Date().toISOString,
+            updatedAt: new Date().toISOString(),
         },
         $push: {
             state: {
