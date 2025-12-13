@@ -85,30 +85,35 @@ app.get("/latest-issues", async (req, res) => {
 })
 app.get("/issues", async (req, res) => {
     try {
-        let { page = 1, limit = 10, priority, status } = req.query;
-
+        let { page = 1, limit = 10, priority, status, category, search = "" } = req.query;
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
 
         const filter = {};
+        if (search)  filter.title = { $regex: search.trim(), $options: "i" };
         if (priority) filter.priority = priority;
+        if (category) filter.category = category;
         if (status) filter.status = status;
 
         const result = await Issues.aggregate([
             { $match: filter },
             {
                 $addFields: {
-                    priorityOrder: {
-                        $cond: [{ $eq: ["$priority", "high"] }, 1, 2]
+                    totalVoted: {
+                        $cond: [
+                            { $isArray: "$voted" },
+                            { $size: "$voted" },
+                            0
+                        ]
                     }
                 }
             },
             { $sort: { priorityOrder: 1, createdAt: -1 } },
             { $skip: (page - 1) * limit },
+            { $project: { state: 0, updatedAt: 0, assignedTo: 0, submittedBy: 0, voted: 0 } },
             { $limit: limit }
         ]).toArray()
-
-        res.send(result);
+        res.send(result ?? []);
     } catch (err) {
         console.error(err);
         res.status(500).send([]);
@@ -299,9 +304,23 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
 });
 
 app.get("/totalIssues", async (req, res) => {
-    const result = await Issues.countDocuments()
-    res.send(Math.ceil(result / req.query?.limit));
-})
+    try {
+        const { limit = 10, priority, status, category, search } = req.query;
+        const filter = {};
+
+        if (priority) filter.priority = priority;
+        if (status) filter.status = status;
+        if (category) filter.category = category;
+        if (search) filter.title = { $regex: search, $options: "i" };
+
+        const total = await Issues.countDocuments(filter);
+
+        res.send(Math.ceil(total / Number(limit)));
+    } catch (err) {
+        res.status(500).send(0);
+    }
+});
+
 app.get("/issuesAnalytics", verifyToken, async (req, res) => {
     try {
         const filter = {};
@@ -435,8 +454,9 @@ app.get("/issuesAnalytics", verifyToken, async (req, res) => {
     }
 })
 
-app.get("/issue/:id", async (req, res) => {
+app.get("/issue/:id", verifyToken, async (req, res) => {
     try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
         const result = await Issues.aggregate([
             { $match: { _id: new ObjectId(req.params.id) } },
             {
@@ -463,6 +483,24 @@ app.get("/issue/:id", async (req, res) => {
                 }
             },
             { $unwind: { path: "$assigned", preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    isVoted: {
+                        $cond: [
+                            { $isArray: "$voted" },
+                            { $in: [user._id, "$voted"] },
+                            false
+                        ]
+                    },
+                    totalVoted: {
+                        $cond: [
+                            { $isArray: "$voted" },
+                            { $size: "$voted" },
+                            0
+                        ]
+                    }
+                }
+            },
             {
                 $project: {
                     voted: 0,
@@ -535,7 +573,7 @@ app.post("/issue", verifyToken, async (req, res) => {
             assignedTo: "",
             voted: [],
             priority: "low",
-            timeline: [],
+            state: [],
             submittedBy: user._id,
             updatedAt: new Date().toISOString(),
             createdAt: new Date().toISOString()
@@ -543,6 +581,60 @@ app.post("/issue", verifyToken, async (req, res) => {
         if (!result.acknowledged) return res.status(500).send({ success: false, message: "Failed to submit your issue" });
 
         res.send({ success: true, message: "Successfully submitted your issue" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
+app.put("/issue", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } });
+        if (!user) return res.status(401).send({ success: false, message: "Unauthorized" });
+
+        const result = await Issues.deleteOne({ _id: new ObjectId(req.body?.id), submittedBy: user._id });
+        if (result.deletedCount === 0) return res.status(500).send({ success: false, message: "Failed to delete your issue" });
+
+        res.send({ success: true, message: "Successfully deleted your issue" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
+app.patch("/issue", verifyToken, async (req, res) => {
+    try {
+        const { issueId, title, description, category } = req.body
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
+
+        const result = await Issues.updateOne({ _id: new ObjectId(issueId), submittedBy: user._id, status: "pending" }, {
+            $set: {
+                title,
+                description,
+                location,
+                category,
+                updatedAt: new Date().toISOString()
+            }
+        })
+        if (!result.modifiedCount) return res.status(500).send({ success: false, message: "Failed to update your issue" });
+
+        res.send({ success: true, message: "Successfully updated your issue" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
+app.patch("/issue-photo", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
+
+        const result = await Issues.updateOne({ _id: new ObjectId(issueId), submittedBy: user._id, status: "pending" }, {
+            $set: {
+                photo: req.body?.photo,
+                updatedAt: new Date().toISOString()
+            }
+        })
+        if (!result.modifiedCount) return res.status(500).send({ success: false, message: "Failed to update your issue" });
+
+        res.send({ success: true, message: "Successfully updated your issue" });
     } catch (error) {
         console.error("DB error: ", error)
         res.status(500).send({ success: false, message: "Internal Server Error!" })
