@@ -54,6 +54,8 @@ const Users = database.collection("users");
 
 Categories.createIndex({ name: 1 }, { unique: true })
 Transactions.createIndex({ transactionId: 1 }, { unique: true });
+Issues.createIndex({ status: 1, createdAt: 1 })
+Issues.createIndex({ status: 1, updatedAt: 1 })
 
 //  Middleware
 const verifyToken = async (req, res, next) => {
@@ -81,6 +83,37 @@ app.get("/latest-issues", async (req, res) => {
         res.status(500).send([])
     }
 })
+app.get("/issues", async (req, res) => {
+    try {
+        let { page = 1, limit = 10, priority, status } = req.query;
+
+        page = Math.max(1, Number(page));
+        limit = Math.max(1, Number(limit));
+
+        const filter = {};
+        if (priority) filter.priority = priority;
+        if (status) filter.status = status;
+
+        const result = await Issues.aggregate([
+            { $match: filter },
+            {
+                $addFields: {
+                    priorityOrder: {
+                        $cond: [{ $eq: ["$priority", "high"] }, 1, 2]
+                    }
+                }
+            },
+            { $sort: { priorityOrder: 1, createdAt: -1 } },
+            { $skip: (page - 1) * limit },
+            { $limit: limit }
+        ]).toArray()
+
+        res.send(result);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send([]);
+    }
+});
 app.get("/categories", async (req, res) => {
     try {
         const result = await Categories.find().toArray()
@@ -220,9 +253,9 @@ app.post("/citizen", async (req, res) => {
 })
 
 // Issues api
-app.get("/issues", async (req, res) => {
+app.get("/privateIssues", verifyToken, async (req, res) => {
     try {
-        let { page = 1, limit = 10, priority, status } = req.query;
+        let { page = 1, limit = 10, priority, status, assignedTo } = req.query;
 
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
@@ -230,9 +263,22 @@ app.get("/issues", async (req, res) => {
         const filter = {};
         if (priority) filter.priority = priority;
         if (status) filter.status = status;
+        if (assignedTo) {
+            const staff = await Users.findOne({ email: req.token_email })
+            filter.assignedTo = staff._id;
+        }
 
-        const pipeline = [
+        const result = await Issues.aggregate([
             { $match: filter },
+            {
+                $lookup: {
+                    from: "users",
+                    localField: "submittedBy",
+                    foreignField: "_id",
+                    as: "user"
+                }
+            },
+            { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
             {
                 $addFields: {
                     priorityOrder: {
@@ -243,9 +289,8 @@ app.get("/issues", async (req, res) => {
             { $sort: { priorityOrder: 1, createdAt: -1 } },
             { $skip: (page - 1) * limit },
             { $limit: limit }
-        ];
+        ]).toArray()
 
-        const result = await Issues.aggregate(pipeline).toArray();
         res.send(result);
     } catch (err) {
         console.error(err);
@@ -257,27 +302,185 @@ app.get("/totalIssues", async (req, res) => {
     const result = await Issues.countDocuments()
     res.send(Math.ceil(result / req.query?.limit));
 })
+app.get("/issuesAnalytics", verifyToken, async (req, res) => {
+    try {
+        const filter = {};
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
+        if (!user) return res.status(401).send([]);
+
+        if (user.role !== "admin") {
+            filter.$or = [
+                { assignedTo: user._id },
+                { submittedBy: user._id }
+            ];
+        }
+        const today = new Date();
+        const lastMonth = new Date();
+        lastMonth.setDate(today.getDate() - 30);
+
+        const pipeline = [
+            { $match: filter },
+            {
+                $facet: {
+                    analyticsData: [
+                        {
+                            $group: {
+                                _id: "$status",
+                                count: { $sum: 1 }
+                            }
+                        }
+                    ],
+
+                    // ===== graph data =====
+                    pending: [
+                        {
+                            $match:
+                            {
+                                status: "pending",
+                                createdAt: { $gte: lastMonth.toISOString() }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: {
+                                    $dateToString: {
+                                        format: "%d-%m-%Y",
+                                        date: { $toDate: "$createdAt" }
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: 1 } }
+                    ],
+
+                    resolved: [
+                        {
+                            $match:
+                            {
+                                status: "resolved",
+                                createdAt: { $gte: lastMonth.toISOString() }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: {
+                                    $dateToString: {
+                                        format: "%d-%m-%Y",
+                                        date: { $toDate: "$updatedAt" }
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: 1 } }
+                    ],
+
+                    closed: [
+                        {
+                            $match:
+                            {
+                                status: "closed",
+                                createdAt: { $gte: lastMonth.toISOString() }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: {
+                                    $dateToString: {
+                                        format: "%d-%m-%Y",
+                                        date: { $toDate: "$updatedAt" }
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: 1 } }
+                    ]
+                }
+            }
+        ];
+
+        const transactionPipline = [
+            { $match: filter },
+            { $match: { createdAt: { $gte: lastMonth.toISOString() } } },
+            {
+                $group: {
+                    _id: {
+                        $dateToString: {
+                            format: "%d-%m-%Y",
+                            date: { $toDate: "$createdAt" }
+                        }
+                    },
+                    totalAmount: { $sum: "$amount" },
+                    totalTransactions: { $sum: 1 }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ]
+        const [result] = await Issues.aggregate(pipeline).toArray();
+        const transactions = await Transactions.aggregate(transactionPipline).toArray()
+        res.send({
+            analyticsData: result.analyticsData,
+            graphicalData: {
+                pending: result.pending,
+                resolved: result.resolved,
+                closed: result.closed
+            },
+            transactions
+        });
+    } catch (error) {
+        console.error(error)
+        res.status(500).send([])
+    }
+})
+
 app.get("/issue/:id", async (req, res) => {
     try {
-        const pipeline = [
+        const result = await Issues.aggregate([
             { $match: { _id: new ObjectId(req.params.id) } },
             {
                 $lookup: {
                     from: "users",
-                    localField: "submittedBy",
-                    foreignField: "_id",
+                    let: { userId: "$submittedBy" },
+                    pipeline: [
+                        { $match: { $expr: { $eq: ["$_id", "$$userId"] } } },
+                        { $project: { email: 1, photo: 1, name: 1 } },
+                    ],
                     as: "user"
                 }
             },
-            { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } }
-        ];
-        const result = await Issues.aggregate(pipeline).toArray();
+            { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: "users",
+                    let: { assignedId: "$assignedTo" },
+                    pipeline: [
+                        { $match: { $expr: { $eq: ["$_id", "$$assignedId"] } } },
+                        { $project: { email: 1, photo: 1, name: 1 } },
+                    ],
+                    as: "assigned"
+                }
+            },
+            { $unwind: { path: "$assigned", preserveNullAndEmptyArrays: true } },
+            {
+                $project: {
+                    voted: 0,
+                    submittedBy: 0,
+                    assignedTo: 0,
+                    transactionId: 0,
+                    updatedAt: 0,
+                }
+            }
+        ]).toArray();
+
         res.send(result[0] || {});
     } catch (err) {
         console.error(err);
         res.status(500).send({});
     }
 });
+
 app.get("/my-issues", verifyToken, async (req, res) => {
     try {
         const { status, limit = 10, skip = 0 } = req.query;
@@ -369,6 +572,27 @@ app.patch("/upvote", verifyToken, async (req, res) => {
     );
     res.send({ success: true });
 });
+app.patch("/issue-status", verifyToken, async (req, res) => {
+    const staff = await Users.findOne({ email: req.token_email });
+    if (staff.role !== "staff") res.status(403).send({ success: false, message: "Forbidden Access!" })
+
+    const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId), assignedTo: staff._id }, {
+        $set: {
+            status: req.body.status,
+            updatedAt: new Date().toISOString,
+        },
+        $push: {
+            state: {
+                title: req.body.status,
+                description: `${staff.name} updated the issue to ${req.body.status}`,
+                completed: true,
+                createdAt: new Date().toISOString()
+            }
+        },
+    });
+    if (!result.modifiedCount) return res.status(500).send({ success: false, message: "Internal Server Error!" })
+    res.send({ success: true, message: "Successfully assigned staff" });
+});
 app.patch("/assign-issue", verifyToken, async (req, res) => {
     const user = await Users.findOne({ email: req.token_email });
     if (user.role !== "admin") res.status(403).send({ success: false, message: "Forbidden Access!" })
@@ -391,7 +615,7 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
             }
         },
     });
-    if(!result.modifiedCount) return res.status(500).send({success: false, message: "Internal Server Error!"})
+    if (!result.modifiedCount) return res.status(500).send({ success: false, message: "Internal Server Error!" })
     res.send({ success: true, message: "Successfully assigned staff" });
 });
 
