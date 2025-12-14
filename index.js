@@ -550,34 +550,6 @@ app.get("/issue/:id", verifyToken, async (req, res) => {
     }
 });
 
-app.get("/my-issues", verifyToken, async (req, res) => {
-    try {
-        const { status, limit = 10, skip = 0 } = req.query;
-        const pipeline = [
-            {
-                $lookup: {
-                    from: "users",
-                    localField: "submittedBy",
-                    foreignField: "_id",
-                    as: "user"
-                }
-            },
-            { $unwind: "$user" },
-            { $match: { "user.email": req.token_email } },
-        ];
-
-        pipeline.push({ $skip: Number(skip) });
-        pipeline.push({ $limit: Number(limit) });
-        if (status) pipeline.push({ $filter: { status } });
-
-        const result = await Issues.aggregate(pipeline).toArray();
-        res.send(result ?? []);
-    } catch (error) {
-        console.error("DB error: ", error);
-        res.status(500).send([]);
-    }
-});
-
 app.post("/issue", verifyToken, async (req, res) => {
     try {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, premium: 1, blocked: 1 } })
@@ -633,9 +605,15 @@ app.put("/issue", verifyToken, async (req, res) => {
 })
 app.patch("/issue", verifyToken, async (req, res) => {
     try {
-        const { issueId, title, description, category } = req.body
+        const { issueId, title, description, location, category } = req.body
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
 
+        const name = category.trim().toLowerCase()
+        await Categories.updateOne(
+            { name },
+            { $setOnInsert: { name } },
+            { upsert: true }
+        )
         const result = await Issues.updateOne({ _id: new ObjectId(issueId), submittedBy: user._id, status: "pending" }, {
             $set: {
                 title,
@@ -657,7 +635,7 @@ app.patch("/issue-photo", verifyToken, async (req, res) => {
     try {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
 
-        const result = await Issues.updateOne({ _id: new ObjectId(issueId), submittedBy: user._id, status: "pending" }, {
+        const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId), submittedBy: user._id, status: "pending" }, {
             $set: {
                 photo: req.body?.photo,
                 updatedAt: new Date().toISOString()
