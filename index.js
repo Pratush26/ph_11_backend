@@ -92,7 +92,7 @@ app.get("/issues", async (req, res) => {
         const filter = {};
         if (search) filter.title = { $regex: search.trim(), $options: "i" };
         if (priority) filter.priority = priority;
-        if (category) filter.category = category;
+        if (category) filter.category = { $regex: category.trim(), $options: "i" };
         if (status) filter.status = status;
 
         const result = await Issues.aggregate([
@@ -281,6 +281,21 @@ app.patch("/userImg", verifyToken, async (req, res) => {
         res.status(500).send({ success: false, message: "Internal Server Error!" })
     }
 })
+app.patch("/block", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { role: 1 } })
+        if (user.role !== "admin") res.status(403).send({ success: false, message: "Forbidden Access!" })
+
+        const result = await Users.updateOne({ email: req.body?.email }, { $set: { blocked: req.body?.blocked == false ? false : true } })
+        console.log("runininion", req.body.blocked, result)
+
+        if (!result.modifiedCount) res.status(500).send({ success: false, message: "Failed to block user" });
+        else res.send({ success: true, message: "Successfully blocked user" });
+    } catch (error) {
+        console.error("DB error: ", error)
+        res.status(500).send({ success: false, message: "Internal Server Error!" })
+    }
+})
 
 // Issues api
 app.get("/privateIssues", verifyToken, async (req, res) => {
@@ -288,7 +303,7 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
         if (!user) return res.status(401).send([]);
 
-        let { page = 1, limit = 10, priority, status, assignedTo } = req.query;
+        let { page = 1, limit = 10, priority, status, assignedTo, submittedBy } = req.query;
 
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
@@ -298,10 +313,8 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         if (status) filter.status = status;
 
         if (user.role !== "admin") {
-            filter.$or = [
-                { assignedTo: user._id },
-                { submittedBy: user._id }
-            ];
+            if(assignedTo) filter.assignedTo = user?._id
+            if(submittedBy) filter.submittedBy = user?._id
         }
 
         const result = await Issues.aggregate([
@@ -834,22 +847,28 @@ app.post("/premium-checkout-session", verifyToken, async (req, res) => {
 })
 
 //  transaction route
-app.get("/transactions", async (req, res) => {
+app.get("/transactions", verifyToken, async (req, res) => {
     try {
-        let { page = 1, limit = 10, email } = req.query;
-        const filter = {};
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
+        if (!user) return res.status(401).send([]);
+
+        let { page = 1, limit = 10, status } = req.query;
 
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
-        if (email) filter.email = email;
 
-        const pipeline = [
+        const filter = {};
+        if (status) filter.status = status;
+
+        if (user.role !== "admin") filter.paidBy = req.token_email
+
+        const result = await Transactions.aggregate([
             { $match: filter },
+            { $sort: { createdAt: -1 } },
             { $skip: (page - 1) * limit },
             { $limit: limit }
-        ];
-        const result = await Transactions.aggregate(pipeline).toArray();
-        res.send(result);
+        ]).toArray()
+        res.send(result ?? []);
     } catch (err) {
         console.error(err);
         res.status(500).send([]);
