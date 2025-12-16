@@ -159,7 +159,7 @@ app.get("/users", async (req, res) => {
                         {
                             $match: {
                                 $expr: { $eq: ["$assignedTo", "$$userId"] },
-                                status: { $in: ["in-progress", "working"] }
+                                status: { $in: ["pending", "in-progress", "working"] }
                             }
                         }
                     ],
@@ -303,8 +303,8 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
         if (!user) return res.status(401).send([]);
 
-        let { page = 1, limit = 10, priority, status, assignedTo, submittedBy } = req.query;
-
+        let { page = 1, limit = 10, priority, status, assignedTo, submittedBy, assigned } = req.query;
+        // console.log(req.query)
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
 
@@ -313,9 +313,10 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         if (status) filter.status = status;
 
         if (user.role !== "admin") {
-            if(assignedTo) filter.assignedTo = user?._id
-            if(submittedBy) filter.submittedBy = user?._id
+            if (assignedTo) filter.assignedTo = user?._id
+            if (submittedBy) filter.submittedBy = user?._id
         }
+        if (assigned) filter.assignedTo = assigned === "true" ? { $type: "objectId" } : { $in: ["", null] };
 
         const result = await Issues.aggregate([
             { $match: filter },
@@ -716,7 +717,6 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
 
     const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId) }, {
         $set: {
-            status: "in-progress",
             assignedTo: staff._id,
             updatedAt: new Date().toISOString(),
         },
@@ -736,8 +736,12 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
 //  payment related route
 app.post("/checkout-session", verifyToken, async (req, res) => {
     try {
+        const user = await Users.findOne({ email: req?.token_email }, {projection: {premium: 1}});
+        if(!user?.premium) res.send({success: false, message: "You need premium subscription for boosting issue!"})
+        
         const issue = await Issues.findOne({ _id: new ObjectId(req.body?.id) });
         if (!issue) return res.send({ url: "" })
+
         const origin = req.headers.origin;
         const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
         const session = await stripe.checkout.sessions.create({
