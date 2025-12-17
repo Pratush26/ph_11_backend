@@ -108,6 +108,13 @@ app.get("/issues", async (req, res) => {
                     }
                 }
             },
+            {
+                $addFields: {
+                    priorityOrder: {
+                        $cond: [{ $eq: ["$priority", "high"] }, 1, 2]
+                    }
+                }
+            },
             { $sort: { priorityOrder: 1, createdAt: -1 } },
             { $skip: (page - 1) * limit },
             { $project: { state: 0, updatedAt: 0, assignedTo: 0, submittedBy: 0, voted: 0 } },
@@ -259,10 +266,18 @@ app.post("/citizen", async (req, res) => {
 app.patch("/userInfo", verifyToken, async (req, res) => {
     try {
         const { name, address, phone } = req.body
-        const result = await Users.updateOne({ email: req.token_email }, {
-            $set: { name, address, phone }
-        })
-
+        const user = await Users.findOne({ email: req.token_email }, { projection: { role: 1 } })
+        if (!user) res.status(404).send({ success: false, message: "User not found!" })
+        let result = null;
+        if (user?.role === "admin") {
+            result = await Users.updateOne({ email: req.body.email }, {
+                $set: { name, address, phone }
+            })
+        } else {
+            result = await Users.updateOne({ email: req.token_email }, {
+                $set: { name, address, phone }
+            })
+        }
         if (!result.modifiedCount) res.status(500).send({ success: false, message: "Failed to update profile details" });
         else res.send({ success: true, message: "Successfully updated profile details" });
     } catch (error) {
@@ -303,14 +318,15 @@ app.get("/privateIssues", verifyToken, async (req, res) => {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
         if (!user) return res.status(401).send([]);
 
-        let { page = 1, limit = 10, priority, status, assignedTo, submittedBy, assigned } = req.query;
-        // console.log(req.query)
+        let { page = 1, limit = 10, category, priority, status, assignedTo, submittedBy, assigned } = req.query;
+
         page = Math.max(1, Number(page));
         limit = Math.max(1, Number(limit));
 
         const filter = {};
         if (priority) filter.priority = priority;
         if (status) filter.status = status;
+        if (category) filter.category = { $regex: category.trim(), $options: "i" };
 
         if (user.role !== "admin") {
             if (assignedTo) filter.assignedTo = user?._id
@@ -375,7 +391,8 @@ app.get("/issuesAnalytics", verifyToken, async (req, res) => {
         if (user.role !== "admin") {
             filter.$or = [
                 { assignedTo: user._id },
-                { submittedBy: user._id }
+                { submittedBy: user._id },
+                { paidBy: req.token_email }
             ];
         }
         const today = new Date();
@@ -465,9 +482,10 @@ app.get("/issuesAnalytics", verifyToken, async (req, res) => {
             }
         ];
 
-        const transactionPipline = [
+        const transactionPipeline = [
             { $match: filter },
             { $match: { createdAt: { $gte: lastMonth.toISOString() } } },
+
             {
                 $group: {
                     _id: {
@@ -480,10 +498,36 @@ app.get("/issuesAnalytics", verifyToken, async (req, res) => {
                     totalTransactions: { $sum: 1 }
                 }
             },
-            { $sort: { _id: 1 } }
-        ]
+
+            { $sort: { _id: 1 } },
+
+            {
+                $facet: {
+                    dailyData: [
+                        {
+                            $project: {
+                                _id: 0,
+                                date: "$_id",
+                                totalAmount: 1,
+                                totalTransactions: 1
+                            }
+                        }
+                    ],
+                    summary: [
+                        {
+                            $group: {
+                                _id: null,
+                                grandTotalAmount: { $sum: "$totalAmount" },
+                                totalDays: { $sum: 1 }
+                            }
+                        }
+                    ]
+                }
+            }
+        ];
+
         const [result] = await Issues.aggregate(pipeline).toArray();
-        const transactions = await Transactions.aggregate(transactionPipline).toArray()
+        const transactions = await Transactions.aggregate(transactionPipeline).toArray()
         res.send({
             analyticsData: result.analyticsData,
             graphicalData: {
@@ -620,7 +664,8 @@ app.put("/issue", verifyToken, async (req, res) => {
 app.patch("/issue", verifyToken, async (req, res) => {
     try {
         const { issueId, title, description, location, category } = req.body
-        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, blocked: 1 } })
+        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
 
         const name = category.trim().toLowerCase()
         await Categories.updateOne(
@@ -647,7 +692,8 @@ app.patch("/issue", verifyToken, async (req, res) => {
 })
 app.patch("/issue-photo", verifyToken, async (req, res) => {
     try {
-        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1 } })
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, blocked: 1 } })
+        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
 
         const result = await Issues.updateOne({ _id: new ObjectId(req.body?.issueId), submittedBy: user._id, status: "pending" }, {
             $set: {
@@ -664,7 +710,8 @@ app.patch("/issue-photo", verifyToken, async (req, res) => {
     }
 })
 app.patch("/upvote", verifyToken, async (req, res) => {
-    const user = await Users.findOne({ email: req.token_email })
+    const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, blocked: 1 } })
+    if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
 
     await Issues.updateOne(
         {
@@ -736,9 +783,10 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
 //  payment related route
 app.post("/checkout-session", verifyToken, async (req, res) => {
     try {
-        const user = await Users.findOne({ email: req?.token_email }, {projection: {premium: 1}});
-        if(!user?.premium) res.send({success: false, message: "You need premium subscription for boosting issue!"})
-        
+        const user = await Users.findOne({ email: req?.token_email }, { projection: { premium: 1, blocked: 1 } });
+        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
+        if (!user?.premium) res.send({ success: false, message: "You need premium subscription for boosting issue!" })
+
         const issue = await Issues.findOne({ _id: new ObjectId(req.body?.id) });
         if (!issue) return res.send({ url: "" })
 
@@ -851,6 +899,18 @@ app.post("/premium-checkout-session", verifyToken, async (req, res) => {
 })
 
 //  transaction route
+app.get("/latest-transactions", verifyToken, async (req, res) => {
+    try {
+        const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
+        if (user.role !== "admin") res.status(403).send([])
+
+        const result = await Transactions.find({}).sort({createdAt : -1}).limit(6).toArray()
+        res.send(result ?? []);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send([]);
+    }
+});
 app.get("/transactions", verifyToken, async (req, res) => {
     try {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
