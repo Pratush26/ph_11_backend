@@ -265,19 +265,14 @@ app.post("/citizen", async (req, res) => {
 })
 app.patch("/userInfo", verifyToken, async (req, res) => {
     try {
-        const { name, address, phone } = req.body
+        const { name, email, address, phone } = req.body
         const user = await Users.findOne({ email: req.token_email }, { projection: { role: 1 } })
         if (!user) res.status(404).send({ success: false, message: "User not found!" })
-        let result = null;
-        if (user?.role === "admin") {
-            result = await Users.updateOne({ email: req.body.email }, {
-                $set: { name, address, phone }
-            })
-        } else {
-            result = await Users.updateOne({ email: req.token_email }, {
-                $set: { name, address, phone }
-            })
-        }
+
+        if (user?.role !== "admin" && req.token_email !== email) res.status(403).send({ success: false, message: "Forbidden Access!" })
+
+        const result = await Users.updateOne({ email }, { $set: { name, address, phone } })
+
         if (!result.modifiedCount) res.status(500).send({ success: false, message: "Failed to update profile details" });
         else res.send({ success: true, message: "Successfully updated profile details" });
     } catch (error) {
@@ -904,7 +899,7 @@ app.get("/latest-transactions", verifyToken, async (req, res) => {
         const user = await Users.findOne({ email: req.token_email }, { projection: { _id: 1, role: 1 } });
         if (user.role !== "admin") res.status(403).send([])
 
-        const result = await Transactions.find({}).sort({createdAt : -1}).limit(6).toArray()
+        const result = await Transactions.find({}).sort({ createdAt: -1 }).limit(6).toArray()
         res.send(result ?? []);
     } catch (err) {
         console.error(err);
