@@ -779,8 +779,8 @@ app.patch("/assign-issue", verifyToken, async (req, res) => {
 app.post("/checkout-session", verifyToken, async (req, res) => {
     try {
         const user = await Users.findOne({ email: req?.token_email }, { projection: { premium: 1, blocked: 1 } });
-        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!" })
-        if (!user?.premium) res.send({ success: false, message: "You need premium subscription for boosting issue!" })
+        if (user.blocked) return res.status(403).send({ success: false, message: "Forbidden Access!", url: "" })
+        if (!user?.premium) res.send({ success: false, message: "You need premium subscription for boosting issue!", url: "" })
 
         const issue = await Issues.findOne({ _id: new ObjectId(req.body?.id) });
         if (!issue) return res.send({ url: "" })
@@ -809,10 +809,10 @@ app.post("/checkout-session", verifyToken, async (req, res) => {
             success_url: `${origin}/after-payment?success=true&type=boost&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${origin}/after-payment?success=false&type=boost`,
         });
-        res.send({ url: session.url });
+        res.send({ success: true, url: session.url });
     } catch (error) {
         console.error(error)
-        res.send({ url: "" })
+        res.send({ success: false, message: "Something went wrong!", url: "" })
     }
 })
 app.patch("/update-paymentStatus", async (req, res) => {
@@ -866,6 +866,7 @@ app.post("/premium-checkout-session", verifyToken, async (req, res) => {
     try {
         const user = await Users.findOne({ email: req.token_email });
         if (user.premium) return res.send({ url: "", message: "You are already a premium subscriber" })
+        
         const origin = req.headers.origin;
         const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
         const session = await stripe.checkout.sessions.create({
@@ -886,10 +887,10 @@ app.post("/premium-checkout-session", verifyToken, async (req, res) => {
             success_url: `${origin}/after-payment?success=true&type=subscription&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${origin}/after-payment?success=false&type=subscription`,
         });
-        res.send({ url: session.url });
+        res.send({ success: true, url: session.url });
     } catch (error) {
         console.error(error)
-        res.send({ url: "" })
+        res.send({ success: false, message: "something went wrong", url: "" })
     }
 })
 
